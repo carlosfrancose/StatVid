@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 import os
+import pandas as pd
 
 
 def ensure_dir(path: str) -> None:
@@ -12,12 +13,11 @@ def ensure_dir(path: str) -> None:
 
 def write_parquet(df: "Any", path: str) -> None:
     """Write dataframe to parquet at path. Placeholder."""
-    # Intentionally not implemented
-    pass
+    dirpath = os.path.dirname(path) or "."
+    ensure_dir(dirpath)
+    df.to_parquet(path, index=False)
 
 
 def read_parquet(path: str) -> "Any":
     """Read parquet into a dataframe. Placeholder."""
-    # Intentionally not implemented
-    pass
-
+    return pd.read_parquet(path)

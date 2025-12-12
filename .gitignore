@@ -19,4 +19,4 @@ artifacts/
 Thumbs.db
 .vscode/
 .idea/
-
+notebooks/.ipynb_checkpoints
