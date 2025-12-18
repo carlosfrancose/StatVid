@@ -1,10 +1,13 @@
-# Python
+# Python and Anaconda
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
 venv/
 .env
+.env.*
+!.env.example
+anaconda_projects/
 
 # Data and artifacts
 data/bronze/

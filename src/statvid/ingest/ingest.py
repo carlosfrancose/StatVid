@@ -9,6 +9,7 @@ from typing import Iterable, Dict, List, Optional, Tuple
 import pandas as pd
 
 from ..config import get_config
+from ..logging_config import configure_logging
 from ..utils.io import ensure_dir, write_parquet
 from ..utils.paths import get_paths
 from .youtube_client import YouTubeClient
@@ -17,16 +18,18 @@ log = logging.getLogger(__name__)
 
 # Category IDs requested by the user
 CATEGORY_MAP: Dict[int, str] = {
+    2: "Autos & Vehicles",
+    15: "Pets & Animals",
+    17: "Sports",
+    19: "Travel & Events",
     20: "Gaming",
+    22: "People & Blogs",
+    23: "Comedy",
     24: "Entertainment",
     26: "Howto & Style",
     27: "Education",
     28: "Science & Technology",
-    22: "People & Blogs",
-    17: "Sports",
-    23: "Comedy",
-    19: "Travel & Events",
-    15: "Pets & Animals",
+
 }
 
 MIN_SUBSCRIBERS = 10_000
@@ -42,31 +45,31 @@ def _bronze_dir(output_dir: Optional[str]) -> str:
     return base
 
 
-def _parse_published_at(value: Optional[str]) -> Optional[datetime]:
-    if not value:
+def _parse_published_at(published_at: Optional[str]) -> Optional[datetime]:
+    if not published_at:
         return None
     try:
-        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(published_at.replace("Z", "+00:00"))
     except ValueError:
         return None
 
 
-def _count_recent_uploads(items: List[Dict[str, object]], *, lookback_days: int) -> Tuple[int, List[str]]:
+def _count_recent_uploads(uploads: List[Dict[str, object]], *, lookback_days: int) -> Tuple[int, List[str]]:
     """Return (number of uploads in window, video ids) for playlist items."""
     threshold = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     count = 0
     video_ids: List[str] = []
-    for item in items:
+    for video in uploads:
         published_at = (
-            item.get("contentDetails", {}).get("videoPublishedAt")
-            or item.get("snippet", {}).get("publishedAt")
+            video.get("contentDetails", {}).get("videoPublishedAt")
+            or video.get("snippet", {}).get("publishedAt")
         )
         dt = _parse_published_at(published_at)
         if dt and dt >= threshold:
             count += 1
-            vid = item.get("contentDetails", {}).get("videoId")
-            if vid:
-                video_ids.append(vid)
+            vid_id = video.get("contentDetails", {}).get("videoId")
+            if vid_id:
+                video_ids.append(vid_id)
     return count, video_ids
 
 
@@ -81,8 +84,12 @@ def _normalize_channels_df(channel_items: List[Dict[str, object]]) -> pd.DataFra
     df = pd.json_normalize(channel_items)
     if "statistics.subscriberCount" in df.columns:
         df["subscriberCount"] = pd.to_numeric(df["statistics.subscriberCount"], errors="coerce").fillna(0).astype(int)
+    else:
+        df["subscriberCount"] = 0
     if "statistics.videoCount" in df.columns:
         df["videoCount"] = pd.to_numeric(df["statistics.videoCount"], errors="coerce").fillna(0).astype(int)
+    else:
+        df["videoCount"] = 0
     if "snippet.country" in df.columns:
         df["country"] = df["snippet.country"]
     else:
@@ -147,19 +154,116 @@ def ingest_channel(channel_id: str, limit: int = 100, output_dir: Optional[str] 
 
     video_ids = client.search_channel_uploads(channel_id, limit=limit)
     uploads_playlist_id = client.get_uploads_playlist_id(channel_id)
-    playlist_items = client.fetch_playlist_items(uploads_playlist_id, page_size=min(limit, 50), max_pages=max(1, limit // 50 + 1)) if uploads_playlist_id else []
+    playlist_items = (
+        client.fetch_playlist_items(
+            uploads_playlist_id,
+            page_size=min(limit, client.page_max),
+            max_pages=max(1, (limit + client.page_max - 1) // client.page_max),
+        )
+        if uploads_playlist_id
+        else []
+    )
 
     uploads_path = os.path.join(uploads_dir, f"{channel_id}.parquet")
-    if playlist_items:
-        uploads_df = pd.json_normalize(playlist_items)
-        write_parquet(uploads_df, uploads_path)
-    else:
-        uploads_df = pd.DataFrame()
-        write_parquet(uploads_df, uploads_path)
+    uploads_df = _to_frame(playlist_items)
+    write_parquet(uploads_df, uploads_path)
 
     videos_path = ingest_videos(video_ids, output_dir=output_dir, client=client)
     log.info("Ingested channel %s with %d videos", channel_id, len(video_ids))
     return {"videos": videos_path, "uploads": uploads_path}
+
+
+def _discover_category(
+    category_id: int,
+    category_name: str,
+    *,
+    per_category: int,
+    min_subscribers: int,
+    min_uploads_last_year: int,
+    lookback_days: int,
+    search_pages: int,
+    overfetch_factor: int,
+    output_dir: Optional[str],
+    client: YouTubeClient,
+    published_after_iso: Optional[str],
+) -> Optional[pd.DataFrame]:
+    bronze_dir = _bronze_dir(output_dir)
+    search_dir = os.path.join(bronze_dir, "search")
+    channels_dir = os.path.join(bronze_dir, "channels")
+    uploads_dir = os.path.join(bronze_dir, "uploads")
+    selection_dir = os.path.join(bronze_dir, "channel_selection")
+    for d in (search_dir, channels_dir, uploads_dir, selection_dir):
+        ensure_dir(d)
+
+    log.info("Discovering channels for category %s (%s)", category_name, category_id)
+    search_items = client.search_videos_by_category(
+        category_id,
+        region_code="US",
+        max_pages=search_pages,
+        order="viewCount",
+        published_after=published_after_iso,
+    )
+    search_df = _to_frame(search_items)
+    write_parquet(search_df, os.path.join(search_dir, f"category_{category_id}.parquet"))
+
+    channel_ids: List[str] = []
+    seen: set[str] = set()
+    for item in search_items:
+        channel_id = item.get("snippet", {}).get("channelId")
+        if channel_id and channel_id not in seen:
+            seen.add(channel_id)
+            channel_ids.append(channel_id)
+    if not channel_ids:
+        log.warning("No channels found for category %s", category_id)
+        return None
+
+    # overfetch to allow filtering and balancing
+    overfetch_total = max(per_category * overfetch_factor, len(channel_ids))
+    channel_ids = channel_ids[:overfetch_total]
+
+    channel_meta = client.fetch_channel_metadata(channel_ids)
+    channels_df = _normalize_channels_df(channel_meta)
+    channels_df["category_id"] = category_id
+    channels_df["category_name"] = category_name
+    write_parquet(channels_df, os.path.join(channels_dir, f"category_{category_id}.parquet"))
+
+    # filter for US, subscriber threshold, available uploads playlist
+    candidates = channels_df[
+        (channels_df["subscriberCount"] >= min_subscribers)
+        & (channels_df["uploads_playlist_id"].notna())
+        & (channels_df["country"].fillna("") == "US")
+    ].copy()
+
+    if candidates.empty:
+        log.warning("No eligible channels after initial filters for category %s", category_id)
+        return None
+
+    # activity check via uploads playlist
+    activity_rows: List[Dict[str, object]] = []
+    for _, row in candidates.iterrows():
+        playlist_id = row["uploads_playlist_id"]
+        playlist_items = client.fetch_playlist_items(playlist_id, page_size=50, max_pages=5)
+        uploads_count, recent_video_ids = _count_recent_uploads(playlist_items, lookback_days=lookback_days)
+        uploads_df = _to_frame(playlist_items)
+        write_parquet(uploads_df, os.path.join(uploads_dir, f"{row['id']}.parquet"))
+
+        if uploads_count >= min_uploads_last_year:
+            row_data = row.to_dict()
+            row_data["uploads_last_year"] = uploads_count
+            row_data["recent_video_ids"] = recent_video_ids
+            activity_rows.append(row_data)
+
+    if not activity_rows:
+        log.warning("No active channels passed activity filter for category %s", category_id)
+        return None
+
+    activity_df = pd.DataFrame(activity_rows)
+    selected = _pick_balanced_channels(activity_df, per_category)
+    selected["category_id"] = category_id
+    selected["category_name"] = category_name
+
+    write_parquet(selected, os.path.join(selection_dir, f"category_{category_id}.parquet"))
+    return selected
 
 
 def discover_channels(
@@ -181,13 +285,6 @@ def discover_channels(
     """
     cfg = get_config()
     client = client or YouTubeClient(api_key=cfg.youtube_api_key)
-    bronze_dir = _bronze_dir(output_dir)
-    search_dir = os.path.join(bronze_dir, "search")
-    channels_dir = os.path.join(bronze_dir, "channels")
-    uploads_dir = os.path.join(bronze_dir, "uploads")
-    selection_dir = os.path.join(bronze_dir, "channel_selection")
-    for d in (search_dir, channels_dir, uploads_dir, selection_dir):
-        ensure_dir(d)
 
     published_after_iso = None
     if published_after_days:
@@ -196,74 +293,28 @@ def discover_channels(
     selections: List[pd.DataFrame] = []
 
     for category_id, category_name in CATEGORY_MAP.items():
-        log.info("Discovering channels for category %s (%s)", category_name, category_id)
-        search_items = client.search_videos_by_category(
+        selected = _discover_category(
             category_id,
-            region_code="US",
-            max_pages=search_pages,
-            order="viewCount",
-            published_after=published_after_iso,
+            category_name,
+            per_category=per_category,
+            min_subscribers=min_subscribers,
+            min_uploads_last_year=min_uploads_last_year,
+            lookback_days=lookback_days,
+            search_pages=search_pages,
+            overfetch_factor=overfetch_factor,
+            output_dir=output_dir,
+            client=client,
+            published_after_iso=published_after_iso,
         )
-        search_df = pd.json_normalize(search_items)
-        write_parquet(search_df, os.path.join(search_dir, f"category_{category_id}.parquet"))
-
-        channel_ids = list({item.get("snippet", {}).get("channelId") for item in search_items if item.get("snippet", {}).get("channelId")})
-        if not channel_ids:
-            log.warning("No channels found for category %s", category_id)
-            continue
-
-        # overfetch to allow filtering and balancing
-        overfetch_total = max(per_category * overfetch_factor, len(channel_ids))
-        channel_ids = channel_ids[:overfetch_total]
-
-        channel_meta = client.fetch_channel_metadata(channel_ids)
-        channels_df = _normalize_channels_df(channel_meta)
-        channels_df["category_id"] = category_id
-        channels_df["category_name"] = category_name
-        write_parquet(channels_df, os.path.join(channels_dir, f"category_{category_id}.parquet"))
-
-        # filter for US, subscriber threshold, available uploads playlist
-        candidates = channels_df[
-            (channels_df["subscriberCount"] >= min_subscribers)
-            & (channels_df["uploads_playlist_id"].notna())
-            & (channels_df["country"].fillna("") == "US")
-        ].copy()
-
-        if candidates.empty:
-            log.warning("No eligible channels after initial filters for category %s", category_id)
-            continue
-
-        # activity check via uploads playlist
-        activity_rows: List[Dict[str, object]] = []
-        for _, row in candidates.iterrows():
-            playlist_id = row["uploads_playlist_id"]
-            playlist_items = client.fetch_playlist_items(playlist_id, page_size=50, max_pages=5)
-            uploads_count, recent_video_ids = _count_recent_uploads(playlist_items, lookback_days=lookback_days)
-            uploads_df = pd.json_normalize(playlist_items)
-            write_parquet(uploads_df, os.path.join(uploads_dir, f"{row['id']}.parquet"))
-
-            if uploads_count >= min_uploads_last_year:
-                row_data = row.to_dict()
-                row_data["uploads_last_year"] = uploads_count
-                row_data["recent_video_ids"] = recent_video_ids
-                activity_rows.append(row_data)
-
-        if not activity_rows:
-            log.warning("No active channels passed activity filter for category %s", category_id)
-            continue
-
-        activity_df = pd.DataFrame(activity_rows)
-        selected = _pick_balanced_channels(activity_df, per_category)
-        selected["category_id"] = category_id
-        selected["category_name"] = category_name
-
-        write_parquet(selected, os.path.join(selection_dir, f"category_{category_id}.parquet"))
-        selections.append(selected)
+        if selected is not None:
+            selections.append(selected)
 
     if not selections:
         raise RuntimeError("No channels selected across categories.")
 
     final_df = pd.concat(selections, ignore_index=True)
+    selection_dir = os.path.join(_bronze_dir(output_dir), "channel_selection")
+    ensure_dir(selection_dir)
     final_path = os.path.join(selection_dir, "all_categories.parquet")
     write_parquet(final_df, final_path)
     log.info("Channel discovery complete. Selected %d channels written to %s", len(final_df), final_path)

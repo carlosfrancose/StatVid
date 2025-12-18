@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from .logging_config import configure_logging
-from .pipelines.pipeline import run_pipeline
+# from .pipelines.pipeline import run_pipeline
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,9 +27,9 @@ def main() -> None:
     args = parser.parse_args()
     configure_logging()
 
-    if args.command == "run":
-        run_pipeline(limit=args.limit, model=args.model, dry_run=args.dry_run)
-    elif args.command == "ingest":
+#    if args.command == "run":
+#        run_pipeline(limit=args.limit, model=args.model, dry_run=args.dry_run)
+    if args.command == "ingest":
         # Placeholder: call ingestion step
         pass
     elif args.command == "features":

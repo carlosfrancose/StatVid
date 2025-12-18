@@ -10,9 +10,10 @@ load_dotenv()
 
 @dataclass(frozen=True)
 class AppConfig:
-    data_dir: str = os.getenv("DATA_DIR", "./data")
-    log_level: str = os.getenv("LOG_LEVEL", "INFO")
-    youtube_api_key: str | None = os.getenv("YOUTUBE_API_KEY")
+    environment: str = os.getenv('ENVIRONMENT', "local")
+    data_dir: str = os.getenv('DATA_DIR', "./data")
+    log_level: str = os.getenv('LOG_LEVEL', "INFO")
+    youtube_api_key: str | None = os.getenv('YOUTUBE_API_KEY')
 
 
 def get_config() -> AppConfig:

@@ -11,7 +11,7 @@ from googleapiclient.errors import HttpError
 
 from ..config import get_config
 
-MAX_IDS_PER_CALL = 50  # YouTube Data API limit for id-based list endpoints
+PAGE_LIMIT = 50  # YouTube Data API'S hard limit for maximum returns per page.
 
 
 class YouTubeClient:
@@ -22,13 +22,17 @@ class YouTubeClient:
         api_key: Optional[str] = None,
         max_retries: int = 3,
         backoff_seconds: float = 1.5,
+        page_max: int = 50
     ) -> None:
         cfg = get_config()
         self.api_key = api_key or cfg.youtube_api_key
         if not self.api_key:
             raise ValueError("YOUTUBE_API_KEY is required to initialize YouTubeClient.")
+        
         self.max_retries = max_retries
         self.backoff_seconds = backoff_seconds
+        self.page_max = min(page_max, PAGE_LIMIT)
+
         self._service_obj = None
         self.log = logging.getLogger(__name__)
 
@@ -64,8 +68,8 @@ class YouTubeClient:
         """Fetch snippet/statistics/contentDetails for a list of video IDs."""
         ids = [vid for vid in video_ids if vid]
         results: List[Dict[str, Any]] = []
-        for i in range(0, len(ids), MAX_IDS_PER_CALL):
-            chunk = ids[i : i + MAX_IDS_PER_CALL]
+        for i in range(0, len(ids), self.page_max):
+            chunk = ids[i : i + self.page_max]
             req = self._get_service().videos().list(
                 part="snippet,statistics,contentDetails",
                 id=",".join(chunk),
@@ -79,8 +83,8 @@ class YouTubeClient:
         """Fetch snippet/statistics/contentDetails for channel ids."""
         ids = [cid for cid in channel_ids if cid]
         results: List[Dict[str, Any]] = []
-        for i in range(0, len(ids), MAX_IDS_PER_CALL):
-            chunk = ids[i : i + MAX_IDS_PER_CALL]
+        for i in range(0, len(ids), self.page_max):
+            chunk = ids[i : i + self.page_max]
             req = self._get_service().channels().list(
                 part="snippet,statistics,contentDetails",
                 id=",".join(chunk),
@@ -109,7 +113,7 @@ class YouTubeClient:
                 part="id,snippet",
                 type="video",
                 videoCategoryId=str(category_id),
-                maxResults=page_size,
+                maxResults=min(page_size, self.page_max),
                 regionCode=region_code,
                 order=order,
                 publishedAfter=published_after,
@@ -151,7 +155,7 @@ class YouTubeClient:
             req = self._get_service().playlistItems().list(
                 part="snippet,contentDetails",
                 playlistId=playlist_id,
-                maxResults=page_size,
+                maxResults=min(page_size, self.page_max),
                 pageToken=token,
             )
             resp = self._execute(req, "playlistItems.list")
@@ -167,10 +171,10 @@ class YouTubeClient:
         uploads_playlist = self.get_uploads_playlist_id(channel_id)
         if not uploads_playlist:
             return []
-        max_pages = max(1, limit // MAX_IDS_PER_CALL + 1)
+        max_pages = max(1, (limit + self.page_max - 1) // self.page_max)
         items = self.fetch_playlist_items(
             uploads_playlist,
-            page_size=min(limit, MAX_IDS_PER_CALL),
+            page_size=min(limit, self.page_max),
             max_pages=max_pages,
         )
         video_ids: List[str] = []

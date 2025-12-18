@@ -1,0 +1,10 @@
+# Enforce LF line endings for all text files
+* text=auto eol=lf
+
+*.py text
+*.ipynb text
+*.env text
+*.md text
+
+# For YouTube thumbnails
+*.jpg binary
