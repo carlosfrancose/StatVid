@@ -111,6 +111,7 @@ class YouTubeClient:
         while pages_fetched < max_pages:
             req = self._get_service().search().list(
                 part="id,snippet",
+                q="*",
                 type="video",
                 videoCategoryId=str(category_id),
                 maxResults=min(page_size, self.page_max),
